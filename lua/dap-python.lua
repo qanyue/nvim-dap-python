@@ -11,7 +11,7 @@ local uv = vim.uv or vim.loop
 --- ```
 --- require('dap-python').test_runner = "pytest"
 --- ```
----@type (string|fun():string) name of the test runner
+---@type string|fun():string name of the test runner
 M.test_runner = nil
 
 
@@ -22,26 +22,13 @@ M.test_runner = nil
 M.resolve_python = nil
 
 
-local function default_runner()
-  if uv.fs_stat('pytest.ini') then
-    return 'pytest'
-  elseif uv.fs_stat('manage.py') then
-    return 'django'
-  else
-    return 'unittest'
-  end
-end
-
 --- Table to register test runners.
 --- Built-in are test runners for unittest, pytest and django.
 --- The key is the test runner name, the value a function to generate the
 --- module name to run and its arguments. See |dap-python.TestRunner|
----@type table<string,TestRunner>
+---@type table<string, dap-python.TestRunner>
 M.test_runners = {}
 
-local function prune_nil(items)
-  return vim.tbl_filter(function(x) return x end, items)
-end
 
 local is_windows = function()
   return vim.fn.has("win32") == 1
@@ -79,6 +66,31 @@ local function roots()
 end
 
 
+local function default_runner()
+  for root in roots() do
+    if uv.fs_stat(root .. "/pytest.ini") then
+      return "pytest"
+    elseif uv.fs_stat(root .. "/manage.py") then
+      return "django"
+    elseif uv.fs_stat(root .. "/pyproject.toml") then
+      local f = io.open(root .. "/pyproject.toml")
+      if f then
+        for line in f:lines() do
+          if line:find("%[tool.pytest") then
+            f:close()
+            return "pytest"
+          end
+        end
+        f:close()
+      end
+    end
+  end
+
+  return "unittest"
+end
+
+
+---@return string|nil
 local get_python_path = function()
   local venv_path = os.getenv('VIRTUAL_ENV')
   if venv_path then
@@ -112,8 +124,11 @@ local get_python_path = function()
 end
 
 
+---@param config dap-python.Config|dap-python.LaunchConfig
+---@param on_config fun(config: dap-python.Config)
 local enrich_config = function(config, on_config)
   if not config.pythonPath and not config.python then
+    ---@diagnostic disable-next-line: inject-field
     config.pythonPath = get_python_path()
   end
   on_config(config)
@@ -146,19 +161,34 @@ local function get_module_path()
   end
 end
 
+
+---@return string[]
+local function flatten(...)
+  local values = {...}
+  if vim.iter then
+    return vim.iter(values):flatten(2):totable()
+  end
+  ---@diagnostic disable-next-line: deprecated
+  return vim.tbl_flatten(values)
+end
+
+
 ---@private
-function M.test_runners.unittest(classname, methodname)
-  local path = get_module_path()
-  local test_path = table.concat(prune_nil({path, classname, methodname}), '.')
+---@param classnames string[]|string
+---@param methodname string?
+function M.test_runners.unittest(classnames, methodname)
+  local test_path = table.concat(flatten(get_module_path(), classnames, methodname), '.')
   local args = {'-v', test_path}
   return 'unittest', args
 end
 
 
 ---@private
-function M.test_runners.pytest(classname, methodname)
+---@param classnames string[]|string
+---@param methodname string?
+function M.test_runners.pytest(classnames, methodname)
   local path = vim.fn.expand('%:p')
-  local test_path = table.concat(prune_nil({path, classname, methodname}), '::')
+  local test_path = table.concat(flatten({path, classnames, methodname}), '::')
   -- -s "allow output to stdout of test"
   local args = {'-s', test_path}
   return 'pytest', args
@@ -166,20 +196,24 @@ end
 
 
 ---@private
-function M.test_runners.django(classname, methodname)
+---@param classnames string[]|string
+---@param methodname string?
+function M.test_runners.django(classnames, methodname)
   local path = get_module_path()
-  local test_path = table.concat(prune_nil({path, classname, methodname}), '.')
+  local test_path = table.concat(flatten({path, classnames, methodname}), '.')
   local args = {'test', test_path}
   return 'django', args
 end
 
 
 --- Register the python debug adapter
----@param adapter_python_path string|nil Path to the python interpreter. Path must be absolute or in $PATH and needs to have the debugpy package installed. Default is `python3`
----@param opts SetupOpts|nil See |dap-python.SetupOpts|
-function M.setup(adapter_python_path, opts)
+---
+---@param python_path "python"|"python3"|"uv"|string|nil Path to python interpreter. Must be in $PATH or an absolute path and needs to have the debugpy package installed. Defaults to `python3`.
+--- If `uv` then debugpy is launched via `uv run`
+---@param opts? dap-python.setup.opts See |dap-python.setup.opts|
+function M.setup(python_path, opts)
   local dap = load_dap()
-  adapter_python_path = adapter_python_path and vim.fn.expand(vim.fn.trim(adapter_python_path), true) or 'python3'
+  python_path = python_path and vim.fn.expand(vim.fn.trim(python_path), true) or 'python3'
   opts = vim.tbl_extend('keep', opts or {}, default_setup_opts)
   dap.adapters.python = function(cb, config)
     if config.request == 'attach' then
@@ -187,7 +221,9 @@ function M.setup(adapter_python_path, opts)
       local port = (config.connect or config).port
       ---@diagnostic disable-next-line: undefined-field
       local host = (config.connect or config).host or '127.0.0.1'
-      cb({
+
+      ---@type dap.ServerAdapter
+      local adapter = {
         type = 'server',
         port = assert(port, '`connect.port` is required for a python `attach` configuration'),
         host = host,
@@ -195,20 +231,41 @@ function M.setup(adapter_python_path, opts)
         options = {
           source_filetype = 'python',
         }
-      })
+      }
+      cb(adapter)
     else
-      cb({
-        type = 'executable';
-        command = adapter_python_path;
-        args = { '-m', 'debugpy.adapter' };
-        enrich_config = enrich_config;
-        options = {
-          source_filetype = 'python',
+      ---@type dap.ExecutableAdapter
+      local adapter
+      if python_path == "uv" then
+        adapter = {
+          type = "executable",
+          command = "uv",
+          args = {"run", "--with", "debugpy", "python", "-m", "debugpy.adapter"},
+          enrich_config = enrich_config,
+          options = {
+            source_filetype = "python"
+          }
         }
-      })
+      else
+        adapter = {
+          type = "executable",
+          command = python_path,
+          args = {"-m", "debugpy.adapter"};
+          enrich_config = enrich_config,
+          options = {
+            source_filetype = "python"
+          }
+        }
+      end
+      cb(adapter)
     end
   end
   dap.adapters.debugpy = dap.adapters.python
+
+  -- nvim-dap logs warnings for unhandled custom events
+  -- Mute it
+  dap.listeners.before["event_debugpySockets"]["dap-python"] = function()
+  end
 
   if opts.include_configs then
     local configs = dap.configurations.python or {}
@@ -216,7 +273,7 @@ function M.setup(adapter_python_path, opts)
     table.insert(configs, {
       type = 'python';
       request = 'launch';
-      name = 'Launch file';
+      name = 'file';
       program = '${file}';
       console = opts.console;
       pythonPath = opts.pythonPath,
@@ -224,10 +281,14 @@ function M.setup(adapter_python_path, opts)
     table.insert(configs, {
       type = 'python';
       request = 'launch';
-      name = 'Launch file with arguments';
+      name = 'file:args';
       program = '${file}';
       args = function()
         local args_string = vim.fn.input('Arguments: ')
+        local utils = require("dap.utils")
+        if utils.splitstr and vim.fn.has("nvim-0.10") == 1 then
+          return utils.splitstr(args_string)
+        end
         return vim.split(args_string, " +")
       end;
       console = opts.console;
@@ -236,7 +297,7 @@ function M.setup(adapter_python_path, opts)
     table.insert(configs, {
       type = 'python';
       request = 'attach';
-      name = 'Attach remote';
+      name = 'attach';
       connect = function()
         local host = vim.fn.input('Host [127.0.0.1]: ')
         host = host ~= '' and host or '127.0.0.1'
@@ -247,7 +308,7 @@ function M.setup(adapter_python_path, opts)
     table.insert(configs, {
       type = 'python',
       request = 'launch',
-      name = 'Run doctests in file',
+      name = 'file:doctest',
       module = 'doctest',
       args = { "${file}" },
       noDebug = true,
@@ -258,50 +319,10 @@ function M.setup(adapter_python_path, opts)
 end
 
 
-local function get_nodes(query_text, predicate)
-  local end_row = api.nvim_win_get_cursor(0)[1]
-  local ft = api.nvim_buf_get_option(0, 'filetype')
-  assert(ft == 'python', 'test_method of dap-python only works for python files, not ' .. ft)
-  local query = (vim.treesitter.query.parse
-    and vim.treesitter.query.parse(ft, query_text)
-    or vim.treesitter.parse_query(ft, query_text)
-  )
-  assert(query, 'Could not parse treesitter query. Cannot find test')
-  local parser = vim.treesitter.get_parser(0)
-  local root = (parser:parse()[1]):root()
-  local nodes = {}
-  for _, node in query:iter_captures(root, 0, 0, end_row) do
-    if predicate(node) then
-      table.insert(nodes, node)
-    end
-  end
-  return nodes
-end
-
-
-local function get_function_nodes()
-  local query_text = [[
-    (function_definition
-      name: (identifier) @name) @definition.function
-  ]]
-  return get_nodes(query_text, function(node)
-    return node:type() == 'identifier'
-  end)
-end
-
-
-local function get_class_nodes()
-  local query_text = [[
-    (class_definition
-      name: (identifier) @name) @definition.class
-  ]]
-  return get_nodes(query_text, function(node)
-    return node:type() == 'identifier'
-  end)
-end
-
-
 local function get_node_text(node)
+  if vim.treesitter.get_node_text then
+    return vim.treesitter.get_node_text(node, 0)
+  end
   local row1, col1, row2, col2 = node:range()
   if row1 == row2 then
     row2 = row2 + 1
@@ -314,24 +335,95 @@ local function get_node_text(node)
 end
 
 
-local function get_parent_classname(node)
-  local parent = node:parent()
-  while parent do
-    local type = parent:type()
-    if type == 'class_definition' then
-      for child in parent:iter_children() do
-        if child:type() == 'identifier' then
-          return get_node_text(child)
-        end
-      end
-    end
-    parent = parent:parent()
+--- Reverse list inline
+---@param list any[]
+local function reverse(list)
+  local len = #list
+  for i = 1, math.floor(len * 0.5) do
+    local opposite = len - i + 1
+    list[i], list[opposite] = list[opposite], list[i]
   end
 end
 
 
----@param opts DebugOpts
-local function trigger_test(classname, methodname, opts)
+---@private
+---@param source string|integer
+---@param subject "function"|"class"
+---@param end_row integer? defaults to cursor
+---@return TSNode[]
+function M._get_nodes(source, subject, end_row)
+  end_row = end_row or api.nvim_win_get_cursor(0)[1]
+  local query_text = [[
+    (function_definition
+      name: (identifier) @function
+    )
+
+    (class_definition
+      name: (identifier) @class
+    )
+  ]]
+  local lang = "python"
+  local query = (vim.treesitter.query.parse
+    and vim.treesitter.query.parse(lang, query_text)
+    or vim.treesitter.parse_query(lang, query_text)
+  )
+  local parser = (
+    type(source) == "number"
+    and vim.treesitter.get_parser(source, lang)
+    or vim.treesitter.get_string_parser(source --[[@as string]], lang)
+  )
+  local trees = parser:parse()
+  local root = trees[1]:root()
+  local nodes = {}
+  for id, node in query:iter_captures(root, source, 0, end_row) do
+    local capture = query.captures[id]
+    if capture == subject then
+      table.insert(nodes, node)
+    end
+  end
+  if not next(nodes) then
+    return nodes
+  end
+  if subject == "function" then
+    local result = nodes[#nodes]
+    local parent = result
+    while parent ~= nil do
+      if parent:type() == "function_definition" then
+        local ident
+        if parent:child(1):type() == "identifier" then
+          ident = parent:child(1)
+        elseif parent:child(2) and parent:child(2):type() == "identifier" then
+          ident = parent:child(2)
+        end
+        result = ident
+      end
+      parent = parent:parent()
+    end
+    return { result }
+  elseif subject == "class" then
+    local last = nodes[#nodes]
+    local parent = last
+    local results = {}
+    while parent ~= nil do
+      if parent:type() == "class_definition" then
+        local ident = parent:child(1)
+        assert(ident:type() == "identifier")
+        table.insert(results, ident)
+      end
+      parent = parent:parent()
+    end
+    reverse(results)
+    return results
+  else
+    error("Expected subject 'function' or 'class', not: " .. subject)
+  end
+end
+
+
+---@param classnames string[]
+---@param methodname string?
+---@param opts dap-python.debug_opts
+local function trigger_test(classnames, methodname, opts)
   local test_runner = opts.test_runner or (M.test_runner or default_runner)
   if type(test_runner) == "function" then
     test_runner = test_runner()
@@ -342,9 +434,11 @@ local function trigger_test(classname, methodname, opts)
     return
   end
   assert(type(runner) == "function", "Test runner must be a function")
-  local module, args = runner(classname, methodname)
+  -- for BWC with custom runners which expect a string instead of a list of strings
+  local classes = #classnames == 1 and classnames[1] or classnames
+  local module, args = runner(classes, methodname)
   local config = {
-    name = table.concat(prune_nil({classname, methodname}), '.'),
+    name = table.concat(flatten(classnames, methodname), '.'),
     type = 'python',
     request = 'launch',
     module = module,
@@ -355,49 +449,51 @@ local function trigger_test(classname, methodname, opts)
 end
 
 
-local function closest_above_cursor(nodes)
-  local result
-  for _, node in pairs(nodes) do
-    if not result then
-      result = node
-    else
-      local node_row1, _, _, _ = node:range()
-      local result_row1, _, _, _ = result:range()
-      if node_row1 > result_row1 then
-        result = node
-      end
-    end
+--- Run test class above cursor
+---@param opts? dap-python.debug_opts See |dap-python.debug_opts|
+function M.test_class(opts)
+  opts = vim.tbl_extend('keep', opts or {}, default_test_opts)
+  local candidates = M._get_nodes(0, "class")
+  if not candidates then
+    print('No test class found near cursor')
+    return
   end
+  local names = vim.tbl_map(get_node_text, candidates)
+  trigger_test(names, nil, opts)
+end
+
+
+---@param node TSNode
+---@result TSNode[]
+local function get_parent_classes(node)
+  local parent = node:parent()
+  local result = {}
+  while parent ~= nil do
+    if parent:type() == "class_definition" then
+      local ident = parent:child(1)
+      assert(ident and ident:type() == "identifier")
+      table.insert(result, ident)
+    end
+    parent = parent:parent()
+  end
+  reverse(result)
   return result
 end
 
 
---- Run test class above cursor
----@param opts? DebugOpts See |dap-python.DebugOpts|
-function M.test_class(opts)
-  opts = vim.tbl_extend('keep', opts or {}, default_test_opts)
-  local class_node = closest_above_cursor(get_class_nodes())
-  if not class_node then
-    print('No suitable test class found')
-    return
-  end
-  local class = get_node_text(class_node)
-  trigger_test(class, nil, opts)
-end
-
-
 --- Run the test method above cursor
----@param opts? DebugOpts See |dap-python.DebugOpts|
+---@param opts? dap-python.debug_opts See |dap-python.debug_opts|
 function M.test_method(opts)
   opts = vim.tbl_extend('keep', opts or {}, default_test_opts)
-  local function_node = closest_above_cursor(get_function_nodes())
-  if not function_node then
-    print('No suitable test method found')
+  local functions = M._get_nodes(0, "function")
+  if not functions or not functions[1] then
+    print('No test method found near cursor')
     return
   end
-  local class = get_parent_classname(function_node)
-  local function_name = get_node_text(function_node)
-  trigger_test(class, function_name, opts)
+  local fn = functions[1]
+  local parent_classes = get_parent_classes(fn)
+  local classnames = vim.tbl_map(get_node_text, parent_classes)
+  trigger_test(classnames, get_node_text(fn), opts)
 end
 
 
@@ -405,6 +501,8 @@ end
 --
 -- >>> remove_indent({'    print(10)', '    if True:', '        print(20)'})
 -- {'print(10)', 'if True:', '    print(20)'}
+---@param lines string[]
+---@return string[]
 local function remove_indent(lines)
   local offset = nil
   for _, line in ipairs(lines) do
@@ -414,6 +512,7 @@ local function remove_indent(lines)
     end
   end
   if offset > 1 then
+    assert(offset)
     return vim.tbl_map(function(x) return string.sub(x, offset) end, lines)
   else
     return lines
@@ -422,7 +521,7 @@ end
 
 
 --- Debug the selected code
----@param opts? DebugOpts
+---@param opts? dap-python.debug_opts
 function M.debug_selection(opts)
   opts = vim.tbl_extend('keep', opts or {}, default_test_opts)
   local start_row, _ = unpack(api.nvim_buf_get_mark(0, '<'))
@@ -440,47 +539,52 @@ end
 
 
 
----@class PathMapping
+---@class dap-python.PathMapping
 ---@field localRoot string
 ---@field remoteRoot string
 
 
----@class DebugpyConfig
+---@class dap-python.Config
 ---@field django boolean|nil Enable django templates. Default is `false`
 ---@field gevent boolean|nil Enable debugging of gevent monkey-patched code. Default is `false`
 ---@field jinja boolean|nil Enable jinja2 template debugging. Default is `false`
 ---@field justMyCode boolean|nil Debug only user-written code. Default is `true`
----@field pathMappings PathMapping[]|nil Map of local and remote paths.
+---@field pathMappings dap-python.PathMapping[]|nil Map of local and remote paths.
 ---@field pyramid boolean|nil Enable debugging of pyramid applications
 ---@field redirectOutput boolean|nil Redirect output to debug console. Default is `false`
 ---@field showReturnValue boolean|nil Shows return value of function when stepping
 ---@field sudo boolean|nil Run program under elevated permissions. Default is `false`
 
----@class DebugpyLaunchConfig : DebugpyConfig
+
+---@class dap-python.LaunchConfig : dap-python.Config
 ---@field module string|nil Name of the module to debug
 ---@field program string|nil Absolute path to the program
 ---@field code string|nil Code to execute in string form
 ---@field python string[]|nil Path to python executable and interpreter arguments
 ---@field args string[]|nil Command line arguments passed to the program
----@field console DebugpyConsole See |dap-python.DebugpyConsole|
+---@field console dap-python.console See |dap-python.console|
 ---@field cwd string|nil Absolute path to the working directory of the program being debugged.
 ---@field env table|nil Environment variables defined as key value pair
 ---@field stopOnEntry boolean|nil Stop at first line of user code.
 
 
----@class DebugOpts
----@field console DebugpyConsole See |dap-python.DebugpyConsole|
----@field test_runner "unittest"|"pytest"|"django"|string name of the test runner. Default is |dap-python.test_runner|
----@field config DebugpyConfig Overrides for the configuration
+---@class dap-python.debug_opts
+---@field console? dap-python.console
+---@field test_runner? "unittest"|"pytest"|"django"|string name of the test runner
+---@field config? dap-python.Config Overrides for the configuration
 
----@class SetupOpts
----@field include_configs boolean Add default configurations
----@field console DebugpyConsole See |dap-python.DebugpyConsole|
----@field pythonPath string|nil Path to python interpreter. Uses interpreter from `VIRTUAL_ENV` environment variable or `adapter_python_path` by default
+---@class dap-python.setup.opts
+---@field include_configs? boolean Add default configurations
+---@field console? dap-python.console
+---
+--- Path to python interpreter. Uses interpreter from `VIRTUAL_ENV` environment
+--- variable or `python_path` by default
+---@field pythonPath? string
 
 
----@alias TestRunner fun(classname: string, methodname: string):string, string[]
+--- A function receiving classname and methodname; must return module to run and its arguments
+---@alias dap-python.TestRunner fun(classname: string|string[], methodname: string?):string, string[]
 
----@alias DebugpyConsole "internalConsole"|"integratedTerminal"|"externalTerminal"|nil
+---@alias dap-python.console 'internalConsole'|'integratedTerminal'|'externalTerminal'|nil
 
 return M
